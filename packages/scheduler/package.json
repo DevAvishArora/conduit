@@ -1,0 +1,15 @@
+{
+  "name": "@conduit/scheduler",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "SERVICE_NAME=scheduler tsx src/main.ts",
+    "dev": "SERVICE_NAME=scheduler tsx watch src/main.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@conduit/shared": "workspace:*",
+    "cron-parser": "^4.9.0"
+  }
+}

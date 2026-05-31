@@ -1,0 +1,71 @@
+{
+  "name": "conduit",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Conduit — Distributed Workflow Orchestration Platform (PERN)",
+  "author": "Avish Arora",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "packageManager": "pnpm@10.33.3",
+  "scripts": {
+    "build": "pnpm -r --filter \"./packages/**\" run build",
+    "typecheck": "pnpm -r run typecheck",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "test": "vitest run && pnpm --filter @conduit/web test",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "test:integration": "INTEGRATION=1 vitest run --testTimeout=120000 tests/integration",
+    "test:web": "pnpm --filter @conduit/web test",
+    "check": "pnpm typecheck && pnpm lint && pnpm format:check && pnpm test",
+    "migrate": "tsx packages/shared/src/db/migrate.ts up",
+    "migrate:down": "tsx packages/shared/src/db/migrate.ts down",
+    "seed": "tsx scripts/seed.ts",
+    "keygen": "tsx scripts/keygen.ts",
+    "dev:api": "tsx watch packages/api/src/main.ts",
+    "dev:dispatcher": "tsx watch packages/dispatcher/src/main.ts",
+    "dev:worker": "tsx watch packages/worker/src/main.ts",
+    "dev:scheduler": "tsx watch packages/scheduler/src/main.ts",
+    "dev:web": "pnpm --filter @conduit/web dev",
+    "stack:up": "docker compose up -d postgres redis",
+    "stack:down": "docker compose down",
+    "prepare": "husky"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.17.0",
+    "@testcontainers/postgresql": "^10.16.0",
+    "@testcontainers/redis": "^10.16.0",
+    "@types/node": "^22.10.2",
+    "@types/supertest": "^6.0.2",
+    "@typescript-eslint/eslint-plugin": "^8.18.1",
+    "@typescript-eslint/parser": "^8.18.1",
+    "@vitest/coverage-v8": "^2.1.9",
+    "eslint": "^9.17.0",
+    "eslint-config-prettier": "^9.1.0",
+    "eslint-plugin-react": "^7.37.3",
+    "eslint-plugin-react-hooks": "^5.1.0",
+    "globals": "^15.14.0",
+    "husky": "^9.1.7",
+    "lint-staged": "^15.3.0",
+    "prettier": "^3.4.2",
+    "supertest": "^7.0.0",
+    "testcontainers": "^10.16.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "typescript-eslint": "^8.18.1",
+    "vitest": "^2.1.8"
+  },
+  "lint-staged": {
+    "*.{ts,tsx}": [
+      "eslint --fix",
+      "prettier --write"
+    ],
+    "*.{js,json,md,yml,yaml,css}": [
+      "prettier --write"
+    ]
+  }
+}

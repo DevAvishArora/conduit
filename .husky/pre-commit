@@ -1,0 +1,4 @@
+#!/usr/bin/env sh
+# Run lint + prettier only on staged files for fast feedback.
+# Full typecheck + tests run in CI (slower; not worth blocking every commit).
+pnpm exec lint-staged
