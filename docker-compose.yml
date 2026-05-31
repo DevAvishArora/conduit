@@ -1,0 +1,117 @@
+# Flow — local stack.
+#   docker compose up -d postgres redis      # just infra (for `pnpm dev:*`)
+#   docker compose --profile app up --build  # full stack incl. services + web
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: flow
+      POSTGRES_PASSWORD: flow
+      POSTGRES_DB: flow
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./infra/postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U flow -d flow"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
+    # Host-mapped to 6380 so a native Homebrew redis on 127.0.0.1:6379 (common
+    # on macOS dev machines) doesn't shadow ours.
+    ports:
+      - "6380:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    profiles: ["app"]
+    build:
+      context: .
+      dockerfile: infra/Dockerfile
+    command: ["pnpm", "--filter", "@conduit/api", "start"]
+    env_file: .env
+    environment:
+      DATABASE_URL: postgres://flow_app:flow_app_pw@postgres:5432/flow
+      DATABASE_ADMIN_URL: postgres://flow:flow@postgres:5432/flow
+      REDIS_URL: redis://redis:6379
+      PUBLIC_BASE_URL: http://localhost:8080
+      HEALTH_PORT: "8080"
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    # The Dockerfile's HEALTHCHECK reads HEALTH_PORT and hits /healthz.
+
+  dispatcher:
+    profiles: ["app"]
+    build: { context: ., dockerfile: infra/Dockerfile }
+    command: ["pnpm", "--filter", "@conduit/dispatcher", "start"]
+    env_file: .env
+    environment:
+      DATABASE_URL: postgres://flow_app:flow_app_pw@postgres:5432/flow
+      REDIS_URL: redis://redis:6379
+      METRICS_PORT: "8081"
+      HEALTH_PORT: "8081"
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      api: { condition: service_healthy }
+
+  worker:
+    profiles: ["app"]
+    build: { context: ., dockerfile: infra/Dockerfile }
+    command: ["pnpm", "--filter", "@conduit/worker", "start"]
+    env_file: .env
+    environment:
+      DATABASE_URL: postgres://flow_app:flow_app_pw@postgres:5432/flow
+      REDIS_URL: redis://redis:6379
+      METRICS_PORT: "8082"
+      HEALTH_PORT: "8082"
+    deploy:
+      replicas: 2
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      api: { condition: service_healthy }
+
+  scheduler:
+    profiles: ["app"]
+    build: { context: ., dockerfile: infra/Dockerfile }
+    command: ["pnpm", "--filter", "@conduit/scheduler", "start"]
+    env_file: .env
+    environment:
+      DATABASE_URL: postgres://flow_app:flow_app_pw@postgres:5432/flow
+      REDIS_URL: redis://redis:6379
+      METRICS_PORT: "8083"
+      HEALTH_PORT: "8083"
+    # Two replicas; leader election guarantees exactly one active (ADR-003).
+    deploy:
+      replicas: 2
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      api: { condition: service_healthy }
+
+  web:
+    profiles: ["app"]
+    build: { context: ., dockerfile: infra/Dockerfile.web }
+    ports:
+      - "5173:80"
+    depends_on:
+      api: { condition: service_healthy }
+
+volumes:
+  pgdata:
+  redisdata:
