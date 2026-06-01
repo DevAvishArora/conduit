@@ -315,10 +315,11 @@ async function handleDelay(db: Db, run: RunRow, nodeId: string, delayMs: number)
  * so callers don't need to clean it up.
  */
 async function nextAttempt(db: Db, runId: string, nodeId: string): Promise<number> {
-  // pg_advisory_xact_lock takes two int4s; hash the (run, node) pair into the
-  // 32-bit space. Collisions just mean unrelated locks occasionally serialise,
-  // which is harmless.
-  await db.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0), hashtext($2))", [
+  // pg_advisory_xact_lock has two overloads: (bigint) and (int4, int4). We
+  // combine (run_id, node_id) into a single bigint via hashtextextended on the
+  // concatenated string. Collisions just mean unrelated locks occasionally
+  // serialise, which is harmless.
+  await db.query("SELECT pg_advisory_xact_lock(hashtextextended($1 || ':' || $2, 0))", [
     runId,
     nodeId,
   ]);
