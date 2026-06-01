@@ -12,9 +12,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # No `version:` here — pnpm/action-setup@v4 reads it from the
+      # `packageManager` field in package.json (canonical source). Specifying
+      # both errors out with ERR_PNPM_BAD_PM_VERSION.
       - uses: pnpm/action-setup@v4
-        with:
-          version: 10
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
@@ -31,9 +32,10 @@ jobs:
     needs: static
     steps:
       - uses: actions/checkout@v4
+      # No `version:` here — pnpm/action-setup@v4 reads it from the
+      # `packageManager` field in package.json (canonical source). Specifying
+      # both errors out with ERR_PNPM_BAD_PM_VERSION.
       - uses: pnpm/action-setup@v4
-        with:
-          version: 10
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
@@ -61,9 +63,10 @@ jobs:
         options: --privileged
     steps:
       - uses: actions/checkout@v4
+      # No `version:` here — pnpm/action-setup@v4 reads it from the
+      # `packageManager` field in package.json (canonical source). Specifying
+      # both errors out with ERR_PNPM_BAD_PM_VERSION.
       - uses: pnpm/action-setup@v4
-        with:
-          version: 10
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
