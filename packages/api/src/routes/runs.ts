@@ -121,6 +121,18 @@ runsRouter.get(
   }),
 );
 
+/**
+ * Parse a non-negative integer from a query/header value, defaulting on
+ * absent values and rejecting nonsense (NaN, negative, fractional). Rejecting
+ * here returns a clean 400 instead of letting `NaN` or `-1` reach the DB.
+ */
+function parseAfterId(raw: unknown): number {
+  if (raw === undefined || raw === null || raw === "") return 0;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 0) throw badRequest("after_id must be a non-negative integer");
+  return n;
+}
+
 // ── events: paginated OR SSE stream ─────────────────────────────
 runsRouter.get(
   "/:id/events",
@@ -129,8 +141,18 @@ runsRouter.get(
     const id = req.params["id"]!;
     const wantsStream = req.headers.accept?.includes("text/event-stream");
 
+    // Verify the run exists in this tenant BEFORE returning any rows or
+    // opening an SSE stream. Without this, an unknown run id would just
+    // return an empty array (paginated) or hang on an empty stream (SSE),
+    // both of which leak the existence boundary and waste resources.
+    const exists = await withTenant(tenantId, async (db) => {
+      const r = await db.query("SELECT 1 FROM runs WHERE id = $1", [id]);
+      return r.rowCount > 0;
+    });
+    if (!exists) throw notFound("run not found");
+
     if (!wantsStream) {
-      const afterId = Number(req.query["after_id"] ?? 0);
+      const afterId = parseAfterId(req.query["after_id"]);
       const rows = await withTenant(tenantId, async (db) => {
         const { rows } = await db.query(
           `SELECT id, event_type, payload, occurred_at FROM run_events
@@ -144,13 +166,18 @@ runsRouter.get(
     }
 
     // SSE: poll the event log and push new rows. Reconnect via Last-Event-ID.
+    // Heartbeat every 15s with an SSE comment line so intermediate proxies
+    // (LB / nginx defaults ~60s idle) don't half-close the connection on a
+    // quiet run.
     res.writeHead(200, {
       "Content-Type": "text/event-stream",
       "Cache-Control": "no-cache",
       Connection: "keep-alive",
+      "X-Accel-Buffering": "no", // disables nginx response buffering
     });
-    let lastId = Number(req.headers["last-event-id"] ?? req.query["after_id"] ?? 0);
+    let lastId = parseAfterId(req.headers["last-event-id"] ?? req.query["after_id"]);
     let open = true;
+    let lastWriteAt = Date.now();
     req.on("close", () => {
       open = false;
     });
@@ -172,10 +199,17 @@ runsRouter.get(
       for (const ev of rows) {
         lastId = ev.id;
         res.write(`id: ${ev.id}\nevent: ${ev.event_type}\ndata: ${JSON.stringify(ev)}\n\n`);
+        lastWriteAt = Date.now();
       }
       if (terminal && rows.length === 0) {
         res.write(`event: done\ndata: {}\n\n`);
         break;
+      }
+      // Heartbeat to keep proxies happy. SSE comments start with `:` and are
+      // ignored by EventSource consumers.
+      if (Date.now() - lastWriteAt >= 15_000) {
+        res.write(`: heartbeat ${new Date().toISOString()}\n\n`);
+        lastWriteAt = Date.now();
       }
       await sleep(750);
     }
@@ -262,14 +296,24 @@ async function control(
       case "retry": {
         if (!["FAILED", "CANCELLED"].includes(status))
           throw conflict(`can only retry a FAILED/CANCELLED run, not ${status}`);
-        // Resume from the last failed node.
+        // Resume from the last failed node. For CANCELLED runs this is often
+        // absent — a user can cancel a run that's still on its first node
+        // before anything has failed — so we return a clear 409 rather than
+        // silently no-op'ing (which would leave the user wondering why the
+        // run didn't restart). The "right" UX would be retry-from-start; that
+        // is on the roadmap.
         const failed = await db.query<{ node_id: string }>(
           `SELECT node_id FROM node_attempts WHERE run_id=$1 AND status='FAILED'
             ORDER BY started_at DESC LIMIT 1`,
           [id],
         );
         const node = failed.rows[0]?.node_id;
-        if (!node) throw badRequest("no failed node to retry");
+        if (!node)
+          throw conflict(
+            status === "CANCELLED"
+              ? "cancelled run has no failed node to resume from; create a new run instead"
+              : "no failed node to retry",
+          );
         await db.query(
           "UPDATE runs SET status='RUNNING', resume_node_id=$2, ended_at=NULL, error_summary=NULL, updated_at=now() WHERE id=$1",
           [id, node],
