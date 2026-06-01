@@ -23,8 +23,13 @@ auditRouter.get(
       const params: unknown[] = [];
       const clauses: string[] = [];
       if (cursor) {
+        // Cast the cursor column too so both sides of the tuple comparison
+        // share types — mixing `id::text` here with raw `id` in the ORDER BY
+        // led to inconsistent paging ordering vs. WHERE clause selectivity.
         params.push(cursor.ts, cursor.id);
-        clauses.push(`(occurred_at, id::text) < ($${params.length - 1}, $${params.length})`);
+        clauses.push(
+          `(occurred_at, id::text) < ($${params.length - 1}::timestamptz, $${params.length})`,
+        );
       }
       if (action) {
         params.push(action);
@@ -48,7 +53,7 @@ auditRouter.get(
                 before, after, ip_address, user_agent, occurred_at
            FROM audit_log
           ${where}
-          ORDER BY occurred_at DESC, id DESC
+          ORDER BY occurred_at DESC, id::text DESC
           LIMIT $${params.length}`,
         params,
       );

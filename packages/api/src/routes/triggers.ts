@@ -131,7 +131,13 @@ triggerDeleteRouter.delete(
     const { tenantId } = requireAuth(req);
     const id = req.params["triggerId"]!;
     const ok = await withTenant(tenantId, async (db) => {
-      const { rowCount } = await db.query("DELETE FROM triggers WHERE id = $1", [id]);
+      // Explicit tenant_id WHERE — defence-in-depth on top of RLS. Means if
+      // RLS were ever weakened, this still refuses to delete another tenant's
+      // trigger by id guess.
+      const { rowCount } = await db.query("DELETE FROM triggers WHERE id = $1 AND tenant_id = $2", [
+        id,
+        tenantId,
+      ]);
       if (rowCount)
         await audit(db, req, { action: "trigger.delete", resourceType: "trigger", resourceId: id });
       return rowCount > 0;

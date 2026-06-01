@@ -76,23 +76,46 @@ workflowsRouter.post(
     const row = await withTenant(tenantId, async (db) => {
       const dup = await db.query("SELECT 1 FROM workflows WHERE name = $1", [body.name]);
       if (dup.rowCount > 0) throw conflict("a workflow with that name exists");
-      const { rows } = await db.query<{ id: string; created_at: string }>(
-        `INSERT INTO workflows (tenant_id, name, draft_definition, created_by)
-         VALUES ($1,$2,$3,$4) RETURNING id, created_at`,
-        [tenantId, body.name, body.definition ? JSON.stringify(body.definition) : null, userId],
-      );
-      const id = rows[0]!.id;
-      await audit(db, req, {
-        action: "workflow.create",
-        resourceType: "workflow",
-        resourceId: id,
-        after: { name: body.name },
-      });
-      return rows[0]!;
+      try {
+        const { rows } = await db.query<{ id: string; created_at: string }>(
+          `INSERT INTO workflows (tenant_id, name, draft_definition, created_by)
+           VALUES ($1,$2,$3,$4) RETURNING id, created_at`,
+          [
+            tenantId,
+            body.name,
+            // Use `!== undefined` (not truthiness) so a definition like `false`
+            // or `0` (rare, but valid JSON) is preserved literally.
+            body.definition !== undefined ? JSON.stringify(body.definition) : null,
+            userId,
+          ],
+        );
+        const id = rows[0]!.id;
+        await audit(db, req, {
+          action: "workflow.create",
+          resourceType: "workflow",
+          resourceId: id,
+          after: { name: body.name },
+        });
+        return rows[0]!;
+      } catch (err) {
+        // Race-condition guard: two concurrent POSTs could both pass the dup
+        // check above. The UNIQUE index on (tenant_id, name) catches that and
+        // raises 23505 — translate it into a clean 409 instead of a 500.
+        if ((err as { code?: string }).code === "23505")
+          throw conflict("a workflow with that name exists");
+        throw err;
+      }
     });
-    res
-      .status(201)
-      .json({ id: row.id, name: body.name, status: "active", created_at: row.created_at });
+    res.status(201).json({
+      id: row.id,
+      name: body.name,
+      // Draft workflows start in 'active' status (means: not archived) with no
+      // current_version — that's how the schema distinguishes draft from
+      // published. Surface a clearer field for API consumers.
+      status: "active",
+      current_version: null,
+      created_at: row.created_at,
+    });
   }),
 );
 
@@ -133,22 +156,35 @@ workflowsRouter.patch(
     if (body.name === undefined && body.definition === undefined)
       throw badRequest("nothing to update");
     const updated = await withTenant(tenantId, async (db) => {
-      const { rows } = await db.query<{ id: string }>(
-        `UPDATE workflows
-            SET name = COALESCE($2, name),
-                draft_definition = COALESCE($3, draft_definition),
-                updated_at = now()
-          WHERE id = $1 AND status = 'active'
-          RETURNING id`,
-        [id, body.name ?? null, body.definition ? JSON.stringify(body.definition) : null],
-      );
-      if (rows.length)
-        await audit(db, req, {
-          action: "workflow.update",
-          resourceType: "workflow",
-          resourceId: id,
-        });
-      return rows[0];
+      try {
+        const { rows } = await db.query<{ id: string }>(
+          `UPDATE workflows
+              SET name = COALESCE($2, name),
+                  draft_definition = COALESCE($3, draft_definition),
+                  updated_at = now()
+            WHERE id = $1 AND status = 'active'
+            RETURNING id`,
+          [
+            id,
+            body.name ?? null,
+            // `!== undefined` so a definition of literal `false`/`0`/`""` is
+            // stored rather than silently swallowed by the COALESCE branch.
+            body.definition !== undefined ? JSON.stringify(body.definition) : null,
+          ],
+        );
+        if (rows.length)
+          await audit(db, req, {
+            action: "workflow.update",
+            resourceType: "workflow",
+            resourceId: id,
+          });
+        return rows[0];
+      } catch (err) {
+        // Rename collision with another workflow in the same tenant → 409.
+        if ((err as { code?: string }).code === "23505")
+          throw conflict("a workflow with that name exists");
+        throw err;
+      }
     });
     if (!updated) throw notFound("workflow not found or archived");
     res.status(204).end();
@@ -174,12 +210,15 @@ workflowsRouter.post(
       const v = validateWorkflow(draft);
       if (!v.ok || !v.definition) throw unprocessable("invalid workflow", { errors: v.errors });
 
-      // Referenced secrets must resolve before we publish.
+      // Referenced secrets must resolve before we publish. The query runs
+      // inside withTenant which sets the RLS `app.tenant_id` GUC — but explicit
+      // tenant_id in the WHERE is defence-in-depth (would catch the case where
+      // RLS is mis-enforced because the app role accidentally has BYPASSRLS).
       const needed = referencedSecrets(v.definition);
       if (needed.length) {
         const found = await db.query<{ name: string }>(
-          "SELECT name FROM secrets WHERE name = ANY($1)",
-          [needed],
+          "SELECT name FROM secrets WHERE tenant_id = $1 AND name = ANY($2)",
+          [tenantId, needed],
         );
         const have = new Set(found.rows.map((r) => r.name));
         const missing = needed.filter((n) => !have.has(n));
@@ -307,7 +346,12 @@ workflowsRouter.get(
   asyncHandler(async (req, res) => {
     const { tenantId } = requireAuth(req);
     const id = req.params["id"]!;
-    const rows = await withTenant(tenantId, async (db) => {
+    const data = await withTenant(tenantId, async (db) => {
+      // Confirm the workflow exists in this tenant before returning rows —
+      // otherwise this endpoint behaves inconsistently with GET /:id, which
+      // returns 404 for missing workflows.
+      const wf = await db.query("SELECT 1 FROM workflows WHERE id = $1", [id]);
+      if (wf.rowCount === 0) return null;
       const { rows } = await db.query(
         `SELECT id, version_number, published_at, published_by
            FROM workflow_versions WHERE workflow_id = $1 ORDER BY version_number DESC`,
@@ -315,6 +359,7 @@ workflowsRouter.get(
       );
       return rows;
     });
-    res.json({ items: rows });
+    if (data === null) throw notFound("workflow not found");
+    res.json({ items: data });
   }),
 );
