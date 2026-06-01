@@ -307,7 +307,21 @@ async function handleDelay(db: Db, run: RunRow, nodeId: string, delayMs: number)
   await new DelayedQueue(redis()).schedule(JSON.stringify(envelope), dueAt);
 }
 
+/**
+ * Compute the next attempt number for (run, node). Two dispatcher paths
+ * concurrently scheduling the same node could otherwise both read MAX(attempt)
+ * and emit colliding attempt numbers. Serialise them with a transaction-scoped
+ * advisory lock keyed by (run_id, node_id) — the lock auto-releases at commit
+ * so callers don't need to clean it up.
+ */
 async function nextAttempt(db: Db, runId: string, nodeId: string): Promise<number> {
+  // pg_advisory_xact_lock takes two int4s; hash the (run, node) pair into the
+  // 32-bit space. Collisions just mean unrelated locks occasionally serialise,
+  // which is harmless.
+  await db.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0), hashtext($2))", [
+    runId,
+    nodeId,
+  ]);
   const { rows } = await db.query<{ next: number }>(
     `SELECT COALESCE(MAX(attempt_number), 0) + 1 AS next
        FROM node_attempts WHERE run_id = $1 AND node_id = $2`,
@@ -389,7 +403,7 @@ export async function handleNodeCompleted(msg: NodeCompletedMessage): Promise<vo
 
     // Idempotency-finalise the attempt: if it's still RUNNING (DELAY continuation
     // path), mark it SUCCEEDED here. Worker-completed attempts are already final.
-    await db.query(
+    const { rowCount: updatedRows } = await db.query(
       `UPDATE node_attempts SET status = $4, ended_at = now(), output_snapshot = COALESCE(output_snapshot, $5)
         WHERE run_id = $1 AND node_id = $2 AND attempt_number = $3 AND status = 'RUNNING'`,
       [
@@ -400,17 +414,39 @@ export async function handleNodeCompleted(msg: NodeCompletedMessage): Promise<vo
         msg.output ? JSON.stringify(msg.output) : null,
       ],
     );
-    await emit(
-      db,
-      msg.run_id,
-      msg.tenant_id,
-      msg.outcome === "SUCCEEDED" ? "NodeCompleted" : "NodeFailed",
-      {
-        node_id: msg.node_id,
-        attempt: msg.attempt,
-        output: msg.output ?? null,
-      },
-    );
+    // Worker-completed attempts already have status='SUCCEEDED'/'FAILED'; the
+    // UPDATE matches nothing, but in that case the worker has already emitted
+    // its own NodeCompleted/NodeFailed event. Re-emitting here would duplicate
+    // events on the timeline and could confuse SSE clients. Skip if the
+    // UPDATE was a no-op AND there's already a matching event.
+    if (updatedRows === 0) {
+      const { rowCount: alreadyEmitted } = await db.query(
+        `SELECT 1 FROM run_events
+          WHERE run_id = $1
+            AND event_type IN ('NodeCompleted', 'NodeFailed')
+            AND payload->>'node_id' = $2
+            AND (payload->>'attempt')::int = $3
+          LIMIT 1`,
+        [msg.run_id, msg.node_id, msg.attempt],
+      );
+      if (alreadyEmitted > 0) {
+        // Worker beat us to the punch; just proceed with the routing decision
+        // below, no duplicate emission.
+      }
+    }
+    if (updatedRows > 0) {
+      await emit(
+        db,
+        msg.run_id,
+        msg.tenant_id,
+        msg.outcome === "SUCCEEDED" ? "NodeCompleted" : "NodeFailed",
+        {
+          node_id: msg.node_id,
+          attempt: msg.attempt,
+          output: msg.output ?? null,
+        },
+      );
+    }
 
     if (msg.outcome === "FAILED") {
       await finalize(

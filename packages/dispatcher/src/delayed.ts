@@ -22,6 +22,10 @@ export async function runDelayedPump(stop: () => boolean): Promise<void> {
         await sleep(500);
         continue;
       }
+      // Pipeline the xadds so a slow Redis doesn't serialise the whole batch
+      // and exceed our lease TTL — otherwise a peer could acquire leadership
+      // mid-pump and re-pop the same items we're still publishing.
+      const pipe = r.pipeline();
       for (const raw of due) {
         let env: DelayedEnvelope;
         try {
@@ -30,9 +34,22 @@ export async function runDelayedPump(stop: () => boolean): Promise<void> {
           logger.error({ err, raw }, "delayed: bad envelope, dropping");
           continue;
         }
-        const dest = env.stream === "node_tasks" ? STREAMS.nodeTasks : STREAMS.nodeCompleted;
-        await r.xadd(dest, "*", "d", JSON.stringify(env.body));
+        // Explicit allow-list rather than `=== "node_tasks" ? a : b` — any
+        // unexpected value should be loudly rejected, not silently routed to
+        // node_completed where it could re-enter the dispatcher in disguise.
+        let dest: string;
+        if (env.stream === "node_tasks") dest = STREAMS.nodeTasks;
+        else if (env.stream === "node_completed") dest = STREAMS.nodeCompleted;
+        else {
+          logger.error(
+            { stream: env.stream, raw },
+            "delayed: envelope has unknown stream, dropping",
+          );
+          continue;
+        }
+        pipe.xadd(dest, "*", "d", JSON.stringify(env.body));
       }
+      await pipe.exec();
     } catch (err) {
       logger.error({ err }, "delayed pump cycle error");
       await sleep(1000);

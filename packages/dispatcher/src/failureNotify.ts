@@ -11,14 +11,7 @@
  * the run "more failed". Errors are logged.
  */
 import "@conduit/shared/handlers"; // side-effect: ensure NotifyHandler is registered
-import {
-  getHandler,
-  loadConfig,
-  logger,
-  renderDeep,
-  secretResolver,
-  withTenant,
-} from "@conduit/shared";
+import { getHandler, logger, renderDeep, secretResolver, withTenant } from "@conduit/shared";
 
 interface FailureNotifyConfig {
   channel: "slack" | "email";
@@ -39,7 +32,8 @@ interface FailureContext {
 export async function notifyOnFailure(tenantId: string, ctx: FailureContext): Promise<void> {
   const cfgRow = await withTenant(tenantId, async (db) => {
     const { rows } = await db.query<{ config: FailureNotifyConfig }>(
-      "SELECT config FROM connector_configs WHERE connector_type = 'failure_notify' LIMIT 1",
+      "SELECT config FROM connector_configs WHERE tenant_id = $1 AND connector_type = 'failure_notify' LIMIT 1",
+      [tenantId],
     );
     return rows[0]?.config ?? null;
   });
@@ -51,11 +45,19 @@ export async function notifyOnFailure(tenantId: string, ctx: FailureContext): Pr
     return;
   }
 
-  const cfg = loadConfig();
+  // Bindings the template engine exposes. Keep the field names in sync with
+  // the doc string — the README & inline examples reference `run.run_id`,
+  // `run.workflow_id`, `run.error_summary`. `error_summary` can be null on
+  // some failure paths, so default to a human-readable placeholder rather
+  // than letting templates render `FAILED: null`.
   const templateContext = {
     trigger: { payload: null },
     nodes: {},
-    run: ctx, // bonus binding so users can reference {{run.id}} / {{run.error_summary}}
+    run: {
+      run_id: ctx.run_id,
+      workflow_id: ctx.workflow_id,
+      error_summary: ctx.error_summary ?? "no error summary available",
+    },
   };
   const rendered = renderDeep(
     {
@@ -84,6 +86,5 @@ export async function notifyOnFailure(tenantId: string, ctx: FailureContext): Pr
     logger.error({ err, run_id: ctx.run_id }, "failure-notify delivery failed");
   } finally {
     clearTimeout(t);
-    void cfg; // satisfy "unused" if loadConfig() side-effects mattered
   }
 }
