@@ -404,7 +404,7 @@ export async function handleNodeCompleted(msg: NodeCompletedMessage): Promise<vo
 
     // Idempotency-finalise the attempt: if it's still RUNNING (DELAY continuation
     // path), mark it SUCCEEDED here. Worker-completed attempts are already final.
-    const { rowCount: updatedRows } = await db.query(
+    await db.query(
       `UPDATE node_attempts SET status = $4, ended_at = now(), output_snapshot = COALESCE(output_snapshot, $5)
         WHERE run_id = $1 AND node_id = $2 AND attempt_number = $3 AND status = 'RUNNING'`,
       [
@@ -415,27 +415,21 @@ export async function handleNodeCompleted(msg: NodeCompletedMessage): Promise<vo
         msg.output ? JSON.stringify(msg.output) : null,
       ],
     );
-    // Worker-completed attempts already have status='SUCCEEDED'/'FAILED'; the
-    // UPDATE matches nothing, but in that case the worker has already emitted
-    // its own NodeCompleted/NodeFailed event. Re-emitting here would duplicate
-    // events on the timeline and could confuse SSE clients. Skip if the
-    // UPDATE was a no-op AND there's already a matching event.
-    if (updatedRows === 0) {
-      const { rowCount: alreadyEmitted } = await db.query(
-        `SELECT 1 FROM run_events
-          WHERE run_id = $1
-            AND event_type IN ('NodeCompleted', 'NodeFailed')
-            AND payload->>'node_id' = $2
-            AND (payload->>'attempt')::int = $3
-          LIMIT 1`,
-        [msg.run_id, msg.node_id, msg.attempt],
-      );
-      if (alreadyEmitted > 0) {
-        // Worker beat us to the punch; just proceed with the routing decision
-        // below, no duplicate emission.
-      }
-    }
-    if (updatedRows > 0) {
+    // Redelivery guard: only emit the run-event if a matching one doesn't
+    // already exist. Stream consumer-group redelivery can drive the same
+    // message through this code path more than once on a crashed-mid-handler
+    // path; SSE clients dedup by event id, but skipping here keeps the audit
+    // log clean.
+    const { rowCount: alreadyEmitted } = await db.query(
+      `SELECT 1 FROM run_events
+        WHERE run_id = $1
+          AND event_type IN ('NodeCompleted', 'NodeFailed')
+          AND payload->>'node_id' = $2
+          AND (payload->>'attempt')::int = $3
+        LIMIT 1`,
+      [msg.run_id, msg.node_id, msg.attempt],
+    );
+    if (alreadyEmitted === 0) {
       await emit(
         db,
         msg.run_id,
