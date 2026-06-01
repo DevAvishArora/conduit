@@ -142,58 +142,83 @@ oauthRouter.get(
       return redirectToWebError(res, cfg.WEB_BASE_URL, "email_not_verified");
     }
 
-    // Look up / link / create.
+    // Look up / link / create AND mint the refresh family in a SINGLE
+    // transaction so the whole sign-in is atomic. Previously this ran as two
+    // withSystem() calls — if the family insert failed after a fresh user/
+    // tenant was already committed, the user would exist with no usable
+    // session and a 500 would be returned. FOR UPDATE on candidate user rows
+    // serialises concurrent OAuth callbacks for the same Google account /
+    // email so they can't both create-link in parallel.
     const result = await withSystem(async (db) => {
       const byGoogle = await db.query<{ id: string; tenant_id: string; role: Role }>(
-        "SELECT id, tenant_id, role FROM users WHERE google_id = $1",
+        "SELECT id, tenant_id, role FROM users WHERE google_id = $1 FOR UPDATE",
         [profile.sub],
       );
+      let user: { id: string; tenant_id: string; role: Role };
       if (byGoogle.rowCount > 0) {
         await db.query("UPDATE users SET last_auth_provider = 'google' WHERE id = $1", [
           byGoogle.rows[0]!.id,
         ]);
-        return byGoogle.rows[0]!;
-      }
-      const byEmail = await db.query<{ id: string; tenant_id: string; role: Role }>(
-        "SELECT id, tenant_id, role FROM users WHERE email = $1",
-        [profile.email],
-      );
-      if (byEmail.rowCount > 0) {
-        // Link Google to the existing account.
-        await db.query(
-          "UPDATE users SET google_id = $2, last_auth_provider = 'google' WHERE id = $1",
-          [byEmail.rows[0]!.id, profile.sub],
+        user = byGoogle.rows[0]!;
+      } else {
+        const byEmail = await db.query<{ id: string; tenant_id: string; role: Role }>(
+          "SELECT id, tenant_id, role FROM users WHERE email = $1 FOR UPDATE",
+          [profile.email],
         );
-        return byEmail.rows[0]!;
+        if (byEmail.rowCount > 0) {
+          // Silent account linking: a local password account with the same
+          // verified email gets the Google sub attached. v1 trade-off — a
+          // confirmation interstitial is on the roadmap.
+          await db.query(
+            "UPDATE users SET google_id = $2, last_auth_provider = 'google' WHERE id = $1",
+            [byEmail.rows[0]!.id, profile.sub],
+          );
+          user = byEmail.rows[0]!;
+        } else {
+          // Brand-new user — create tenant + user. Admin role for the founder.
+          const tenantName = profile.name?.trim() || profile.given_name?.trim() || "Personal";
+          const tenant = await db.query<{ id: string }>(
+            "INSERT INTO tenants (name) VALUES ($1) RETURNING id",
+            [tenantName],
+          );
+          const tenantId = tenant.rows[0]!.id;
+          try {
+            const inserted = await db.query<{ id: string; tenant_id: string; role: Role }>(
+              `INSERT INTO users (tenant_id, email, google_id, role, last_auth_provider, hashed_password)
+               VALUES ($1, $2, $3, 'admin', 'google', NULL)
+               RETURNING id, tenant_id, role`,
+              [tenantId, profile.email, profile.sub],
+            );
+            user = inserted.rows[0]!;
+          } catch (err) {
+            // Concurrent OAuth callbacks for the same email/google_id race
+            // here; the unique constraint catches it. Signal a retryable error
+            // — the retry will hit the byGoogle/byEmail branch above.
+            if ((err as { code?: string }).code === "23505") {
+              return { retry: true as const };
+            }
+            throw err;
+          }
+        }
       }
-      // Brand-new user — create tenant + user. Admin role for the founder
-      // (same as email registration).
-      const tenantName = profile.name?.trim() || profile.given_name?.trim() || "Personal";
-      const tenant = await db.query<{ id: string }>(
-        "INSERT INTO tenants (name) VALUES ($1) RETURNING id",
-        [tenantName],
-      );
-      const tenantId = tenant.rows[0]!.id;
-      const user = await db.query<{ id: string; tenant_id: string; role: Role }>(
-        `INSERT INTO users (tenant_id, email, google_id, role, last_auth_provider, hashed_password)
-         VALUES ($1, $2, $3, 'admin', 'google', NULL)
-         RETURNING id, tenant_id, role`,
-        [tenantId, profile.email, profile.sub],
-      );
-      return user.rows[0]!;
-    });
-
-    // Mint our own tokens — same flow as email/password sign-in.
-    const fam = await withSystem(async (db) => {
-      const { rows } = await db.query<{ id: string }>(
+      const { rows: famRows } = await db.query<{ id: string }>(
         "INSERT INTO refresh_families (user_id, tenant_id) VALUES ($1, $2) RETURNING id",
-        [result.id, result.tenant_id],
+        [user.id, user.tenant_id],
       );
-      return rows[0]!.id;
+      return { user, fam: famRows[0]!.id };
     });
 
-    const access = signAccess({ sub: result.id, tid: result.tenant_id, role: result.role });
-    const refresh = signRefresh({ sub: result.id, tid: result.tenant_id, fam });
+    if ("retry" in result) {
+      return redirectToWebError(res, cfg.WEB_BASE_URL, "concurrent_signup_retry");
+    }
+    const { user: oauthUser, fam } = result;
+
+    const access = signAccess({
+      sub: oauthUser.id,
+      tid: oauthUser.tenant_id,
+      role: oauthUser.role,
+    });
+    const refresh = signRefresh({ sub: oauthUser.id, tid: oauthUser.tenant_id, fam });
 
     // Redirect with tokens in the URL fragment. Fragment never reaches the
     // server (not in logs / Referer headers).
