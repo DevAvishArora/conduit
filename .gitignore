@@ -1,0 +1,13 @@
+node_modules/
+dist/
+.env
+.env.local
+*.log
+coverage/
+.DS_Store
+keys/*.pem
+!keys/.gitkeep
+web/dist/
+packages/web/dist/
+.vite/
+.turbo/

@@ -1,0 +1,14 @@
+{
+  "name": "@conduit/worker",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "SERVICE_NAME=worker tsx src/main.ts",
+    "dev": "SERVICE_NAME=worker tsx watch src/main.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@conduit/shared": "workspace:*"
+  }
+}

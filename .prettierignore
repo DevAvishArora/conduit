@@ -1,0 +1,9 @@
+node_modules
+dist
+.vite
+coverage
+keys
+pnpm-lock.yaml
+**/*.md
+SYSTEM_DESIGN.md
+.claude
