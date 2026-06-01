@@ -1,7 +1,7 @@
 import cors from "cors";
 import express, { type Express } from "express";
 import helmet from "helmet";
-import { logger, metricsRegistry, pool, redis } from "@conduit/shared";
+import { loadConfig, logger, metricsRegistry, pool, redis } from "@conduit/shared";
 import type { AuthedRequest } from "./http.js";
 import { authenticate } from "./middleware/auth.js";
 import { errorHandler, notFoundHandler } from "./middleware/error.js";
@@ -17,11 +17,26 @@ import { triggerDeleteRouter, triggersRouter, webhookRouter } from "./routes/tri
 import { workflowsRouter } from "./routes/workflows.js";
 
 export function buildApp(): Express {
+  const cfg = loadConfig();
   const app = express();
   app.disable("x-powered-by");
   app.set("trust proxy", true);
   app.use(helmet());
-  app.use(cors());
+
+  // CORS: explicit allow-list from CORS_ORIGINS. Empty list = no cross-origin
+  // requests allowed (server-to-server or same-origin only). A wildcard `*`
+  // entry is honoured (dev-only) but logged as a warning.
+  if (cfg.CORS_ORIGINS.includes("*")) {
+    logger.warn("CORS configured with '*' — only safe in development");
+    app.use(cors({ origin: true, credentials: false }));
+  } else {
+    app.use(
+      cors({
+        origin: cfg.CORS_ORIGINS.length === 0 ? false : cfg.CORS_ORIGINS,
+        credentials: true,
+      }),
+    );
+  }
 
   // Capture the raw body for webhook HMAC verification while still parsing JSON
   // for everything else. 1 MB request cap (§5.3.1).
@@ -64,11 +79,23 @@ export function buildApp(): Express {
     });
   });
 
-  // Prometheus scrape endpoint (no auth — protect by network policy in prod).
-  app.get("/metrics", async (_req, res) => {
-    res.setHeader("content-type", metricsRegistry.contentType);
-    res.end(await metricsRegistry.metrics());
-  });
+  // Prometheus scrape endpoint. Gated by METRICS_ENABLED (default on) AND, if
+  // METRICS_TOKEN is set, requires `Authorization: Bearer <token>` so it can
+  // be safely exposed via the public load balancer instead of relying on a
+  // private network policy.
+  if (cfg.METRICS_ENABLED) {
+    app.get("/metrics", async (req, res) => {
+      if (cfg.METRICS_TOKEN) {
+        const hdr = req.headers.authorization;
+        if (hdr !== `Bearer ${cfg.METRICS_TOKEN}`) {
+          res.status(401).end();
+          return;
+        }
+      }
+      res.setHeader("content-type", metricsRegistry.contentType);
+      res.end(await metricsRegistry.metrics());
+    });
+  }
 
   app.use(metricsMiddleware);
 

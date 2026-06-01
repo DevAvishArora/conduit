@@ -77,6 +77,26 @@ const Schema = z.object({
   // Origin where the React app lives — the API redirects here with tokens in
   // the URL fragment after OAuth. In prod, often the same origin as the API.
   WEB_BASE_URL: z.string().default("http://localhost:5173"),
+
+  // CORS allowed origins. Comma-separated list. Empty/unset = same-origin only.
+  // Use `*` ONLY in dev — disables credentials in browsers and weakens auth.
+  CORS_ORIGINS: z
+    .string()
+    .optional()
+    .transform((v) =>
+      v
+        ? v
+            .split(",")
+            .map((s) => s.trim())
+            .filter(Boolean)
+        : [],
+    ),
+
+  // /metrics endpoint protection. METRICS_ENABLED=false (or 0) disables it
+  // entirely. METRICS_TOKEN, if set, requires `Authorization: Bearer <token>`
+  // on every /metrics request (defence-in-depth on top of network policy).
+  METRICS_ENABLED: bool(true),
+  METRICS_TOKEN: z.string().optional(),
 });
 
 export type Config = z.infer<typeof Schema> & {

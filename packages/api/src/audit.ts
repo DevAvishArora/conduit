@@ -27,8 +27,11 @@ export async function audit(
       entry.action,
       entry.resourceType,
       entry.resourceId ?? null,
-      entry.before ? JSON.stringify(entry.before) : null,
-      entry.after ? JSON.stringify(entry.after) : null,
+      // Use `!== undefined` (not truthiness) so audited values of `0`, `false`,
+      // `""`, or `{}` are recorded as they actually were — losing those in an
+      // audit trail makes incident reconstruction harder.
+      entry.before !== undefined ? JSON.stringify(entry.before) : null,
+      entry.after !== undefined ? JSON.stringify(entry.after) : null,
       req.ip ?? null,
       req.headers["user-agent"] ?? null,
     ],

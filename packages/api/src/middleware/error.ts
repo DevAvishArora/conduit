@@ -13,11 +13,17 @@ export function errorHandler(err: unknown, req: Request, res: Response, _next: N
       title: "Unprocessable Entity",
       status: 422,
       detail: "request validation failed",
+      instance: req.originalUrl,
       errors: err.issues.map((i) => ({ path: i.path.join("."), message: i.message })),
     };
   } else {
     logger.error({ err, path: req.originalUrl }, "unhandled error");
-    problem = { type: "about:blank", title: "Internal Server Error", status: 500 };
+    problem = {
+      type: "about:blank",
+      title: "Internal Server Error",
+      status: 500,
+      instance: req.originalUrl,
+    };
   }
   res.status(problem.status).type("application/problem+json").json(problem);
 }
